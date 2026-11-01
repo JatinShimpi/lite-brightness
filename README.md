@@ -92,7 +92,7 @@ device=VID_0E6A
 You need Rust (stable) and the MSVC toolchain.
 
 ```
-git clone <this repo>
+git clone https://github.com/JatinShimpi/lite-brightness
 cd lite-brightness
 cargo build --release
 ```

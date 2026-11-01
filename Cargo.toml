@@ -5,6 +5,7 @@ edition = "2021"
 description = "Tiny Twinkle Tray alternative for Windows: laptop + external monitor brightness (DDC/CI, WMI) from the tray, with keyboard volume-dial support (Ant Esports MK800)"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/JatinShimpi/lite-brightness"
 keywords = ["brightness", "monitor", "ddc-ci", "twinkletray", "twinkle-tray"]
 categories = ["os::windows-apis", "hardware-support", "gui"]
 

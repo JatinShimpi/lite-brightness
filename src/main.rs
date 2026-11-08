@@ -33,17 +33,61 @@ const STEP: i32 = 5;
 const VCP_POWER: u8 = 0xD6;
 const DISPLAYSWITCH: &str = "C:\\Windows\\System32\\DisplaySwitch.exe";
 
-// dial button actions
-const BTN_CYCLE: u8 = 0;
-const BTN_LOCK: u8 = 1;
-const BTN_OFF: u8 = 2;
-const BTN_LOCK_OFF: u8 = 3;
-const BTN_NONE: u8 = 4;
+const WM_BIND: u32 = WM_APP + 3;
+
+// ---------- rebindable actions (like a game's controls screen) ----------
+
+// a key plus held modifiers; vk 0 = not bound
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Key {
+    vk: u16,
+    mods: u8,
+}
+
+// same bit values as RegisterHotKey's modifiers, so they can be passed straight through
+const MOD_ALT: u8 = 1;
+const MOD_CTRL: u8 = 2;
+const MOD_SHIFT: u8 = 4;
+const MOD_WIN: u8 = 8;
+
+const NONE_KEY: Key = Key { vk: 0, mods: 0 };
+const fn bare(vk: u16) -> Key {
+    Key { vk, mods: 0 }
+}
+
+const A_UP: usize = 0;
+const A_DOWN: usize = 1;
+const A_CYCLE: usize = 2;
+const A_LOCK: usize = 3;
+const A_OFF: usize = 4;
+const A_LOCK_OFF: usize = 5;
+const N_ACTIONS: usize = 6;
+const SLOTS: usize = 2;
+
+// (settings-file id, label shown in the key bindings window)
+const ACTIONS: [(&str, &str); N_ACTIONS] = [
+    ("up", "Brightness up"),
+    ("down", "Brightness down"),
+    ("cycle", "Switch display"),
+    ("lock", "Lock PC"),
+    ("off", "Turn screens off"),
+    ("lockoff", "Lock PC + screens off"),
+];
+
+// the dial sends Volume Up / Down when turned and Mute when pressed
+const DEFAULT_BINDS: [[Key; SLOTS]; N_ACTIONS] = [
+    [bare(0xAF), NONE_KEY],
+    [bare(0xAE), NONE_KEY],
+    [bare(0xAD), NONE_KEY],
+    [NONE_KEY, NONE_KEY],
+    [NONE_KEY, NONE_KEY],
+    [NONE_KEY, NONE_KEY],
+];
 
 struct Settings {
-    dial: bool,
-    button: u8,
-    ext_only: bool, // only react to the external keyboard's dial
+    dial: bool,     // brightness up/down keys are active
+    ext_only: bool, // media keys (the dial) only count from the external keyboard
+    binds: [[Key; SLOTS]; N_ACTIONS],
 }
 
 struct Mon {
@@ -65,7 +109,7 @@ struct State {
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
-    s: Settings { dial: true, button: BTN_CYCLE, ext_only: true },
+    s: Settings { dial: true, ext_only: true, binds: DEFAULT_BINDS },
     mons: Vec::new(),
     target: 0,
 });
@@ -80,6 +124,14 @@ static APPLY_PENDING: AtomicBool = AtomicBool::new(false);
 static DRAG: AtomicI32 = AtomicI32::new(-1);
 static DPI: AtomicI32 = AtomicI32::new(96);
 static FLY_HIDDEN_AT: Mutex<Option<Instant>> = Mutex::new(None);
+static KEYS_HWND: AtomicIsize = AtomicIsize::new(0);
+// slot waiting for a key press in the bindings window: action * SLOTS + slot, or -1
+static CAPTURE: AtomicI32 = AtomicI32::new(-1);
+// key whose key-down we swallowed, so its key-up is swallowed too
+static SWALLOWED: AtomicU32 = AtomicU32::new(0);
+static KEYS_NOTE: Mutex<String> = Mutex::new(String::new());
+// a key that clashes with something, waiting for a second press to confirm: (capture slot, key)
+static PENDING: Mutex<Option<(i32, Key)>> = Mutex::new(None);
 
 // the external keyboard is identified by this text in its device name (VID/PID), see settings.txt
 static DEVICE_MATCH: Mutex<String> = Mutex::new(String::new());
@@ -161,17 +213,43 @@ fn settings_path() -> std::path::PathBuf {
     std::path::Path::new(&base).join("lite-brightness").join("settings.txt")
 }
 
+// "175+0,0+0" -> two slots (vk + modifier bits)
+fn parse_slots(v: &str) -> [Key; SLOTS] {
+    let mut out = [NONE_KEY; SLOTS];
+    for (i, part) in v.split(',').take(SLOTS).enumerate() {
+        let (vk, mods) = part.split_once('+').unwrap_or((part, "0"));
+        out[i] = Key { vk: vk.trim().parse().unwrap_or(0), mods: mods.trim().parse().unwrap_or(0) };
+    }
+    out
+}
+
 fn load_settings() {
     let Ok(text) = std::fs::read_to_string(settings_path()) else { return };
     let mut st = lock();
+    let mut old_button: Option<u8> = None;
+    let mut have_binds = false;
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
         match k.trim() {
             "dial" => st.s.dial = v.trim() == "1",
-            "button" => st.s.button = v.trim().parse().unwrap_or(BTN_CYCLE).min(BTN_NONE),
+            "button" => old_button = v.trim().parse().ok(),
             "ext_only" => st.s.ext_only = v.trim() == "1",
             "device" => *DEVICE_MATCH.lock().unwrap_or_else(|e| e.into_inner()) = v.trim().to_uppercase(),
+            k if k.starts_with("bind_") => {
+                if let Some(a) = ACTIONS.iter().position(|(id, _)| *id == &k[5..]) {
+                    st.s.binds[a] = parse_slots(v);
+                    have_binds = true;
+                }
+            }
             _ => {}
+        }
+    }
+    // older versions had one "dial button action": move the Mute key (dial press) to that action
+    if let (false, Some(b)) = (have_binds, old_button) {
+        st.s.binds[A_CYCLE][0] = NONE_KEY;
+        let to = [Some(A_CYCLE), Some(A_LOCK), Some(A_OFF), Some(A_LOCK_OFF), None].get(b as usize).copied().flatten();
+        if let Some(a) = to {
+            st.s.binds[a][0] = bare(0xAD);
         }
     }
 }
@@ -179,7 +257,12 @@ fn load_settings() {
 fn save_settings() {
     let st = lock();
     let device = DEVICE_MATCH.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let text = format!("dial={}\nbutton={}\next_only={}\ndevice={}\n", st.s.dial as u8, st.s.button, st.s.ext_only as u8, device);
+    let mut text = format!("dial={}\next_only={}\ndevice={}\n", st.s.dial as u8, st.s.ext_only as u8, device);
+    for (a, (id, _)) in ACTIONS.iter().enumerate() {
+        let slots: Vec<String> = st.s.binds[a].iter().map(|k| format!("{}+{}", k.vk, k.mods)).collect();
+        text.push_str(&format!("bind_{}={}\n", id, slots.join(",")));
+    }
+    drop(st);
     let p = settings_path();
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -907,39 +990,98 @@ unsafe fn is_external_device(h: HANDLE) -> bool {
     r
 }
 
+// unassigned key, sent after a swallowed Alt/Win combo so the Alt menu / Start menu doesn't open
+const VK_MASK: u16 = 0xE8;
+
+fn is_modifier(vk: u16) -> bool {
+    matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0..=0xA5)
+}
+
+// browser / volume / media / launch keys: these come from the consumer-control page (the dial)
+fn is_media(vk: u16) -> bool {
+    (0xA6..=0xB7).contains(&vk)
+}
+
+unsafe fn held_mods() -> u8 {
+    let down = |vk: VIRTUAL_KEY| (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0;
+    let mut m = 0;
+    if down(VK_CONTROL) {
+        m |= MOD_CTRL;
+    }
+    if down(VK_MENU) {
+        m |= MOD_ALT;
+    }
+    if down(VK_SHIFT) {
+        m |= MOD_SHIFT;
+    }
+    if down(VK_LWIN) || down(VK_RWIN) {
+        m |= MOD_WIN;
+    }
+    m
+}
+
+unsafe fn send_mask_key() {
+    let ev = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(VK_MASK), wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    };
+    let inputs = [ev(KEYBD_EVENT_FLAGS(0)), ev(KEYEVENTF_KEYUP)];
+    SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+}
+
 unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     LAST_WHO.store(4, Ordering::Relaxed);
     LAST_MSG.store(0x1000, Ordering::Relaxed);
     if code == HC_ACTION as i32 {
-        let k = &*(lp.0 as *const KBDLLHOOKSTRUCT);
         // the keyboard driver delivers its media keys as injected, so do not filter those
-        {
-            let from_ext = {
-                let st = lock();
-                !st.s.ext_only || {
-                    let at = EXT_AT_MS.load(Ordering::Relaxed);
-                    at != 0 && now_ms().saturating_sub(at) <= EXT_WINDOW_MS
+        let k = &*(lp.0 as *const KBDLLHOOKSTRUCT);
+        let vk = k.vkCode as u16;
+        let msg = wp.0 as u32;
+        let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        if vk != VK_MASK && !is_modifier(vk) {
+            // the bindings window is waiting for a key: grab it from any keyboard
+            if CAPTURE.load(Ordering::Relaxed) >= 0 {
+                if down {
+                    let mods = held_mods();
+                    if mods & (MOD_ALT | MOD_WIN) != 0 {
+                        send_mask_key();
+                    }
+                    let keys = HWND(KEYS_HWND.load(Ordering::Relaxed) as *mut c_void);
+                    let _ = PostMessageW(keys, WM_BIND, WPARAM(vk as usize), LPARAM(mods as isize));
+                    SWALLOWED.store(vk as u32, Ordering::Relaxed);
                 }
-            };
-            let action = {
-                let st = lock();
-                if !from_ext {
-                    0
-                } else {
-                match VIRTUAL_KEY(k.vkCode as u16) {
-                    VK_VOLUME_UP if st.s.dial && st.target != TARGET_VOLUME => 1,
-                    VK_VOLUME_DOWN if st.s.dial && st.target != TARGET_VOLUME => 2,
-                    VK_VOLUME_MUTE if st.s.button != BTN_NONE => 3,
-                    _ => 0,
+                return LRESULT(1);
+            }
+            if !down {
+                if SWALLOWED.load(Ordering::Relaxed) == vk as u32 {
+                    SWALLOWED.store(0, Ordering::Relaxed);
+                    return LRESULT(1);
                 }
-                }
-            };
-            if action != 0 {
-                if wp.0 as u32 == WM_KEYDOWN || wp.0 as u32 == WM_SYSKEYDOWN {
+            } else {
+                let mods = held_mods();
+                let action = {
+                    let st = lock();
+                    let from_ext = !st.s.ext_only || !is_media(vk) || {
+                        let at = EXT_AT_MS.load(Ordering::Relaxed);
+                        at != 0 && now_ms().saturating_sub(at) <= EXT_WINDOW_MS
+                    };
+                    let key = Key { vk, mods };
+                    st.s.binds
+                        .iter()
+                        .position(|slots| slots.contains(&key))
+                        .filter(|_| from_ext)
+                        // brightness keys are off, or the dial is set to plain Windows volume
+                        .filter(|&a| !((a == A_UP || a == A_DOWN) && (!st.s.dial || st.target == TARGET_VOLUME)))
+                };
+                if let Some(a) = action {
                     LAST_MSG.store(0x1001, Ordering::Relaxed);
-                    let _ = PostMessageW(main_hwnd(), WM_DIAL, WPARAM(action), LPARAM(0));
+                    if mods & (MOD_ALT | MOD_WIN) != 0 {
+                        send_mask_key();
+                    }
+                    SWALLOWED.store(vk as u32, Ordering::Relaxed);
+                    let _ = PostMessageW(main_hwnd(), WM_DIAL, WPARAM(a), LPARAM(0));
+                    return LRESULT(1); // swallow so the key's normal job (e.g. volume) doesn't happen
                 }
-                return LRESULT(1); // swallow so Windows volume doesn't change
             }
         }
     }
@@ -967,10 +1109,10 @@ fn sync_all(st: &mut State) -> Option<i32> {
     Some(avg)
 }
 
-unsafe fn handle_dial(_hwnd: HWND, kind: usize) {
-    match kind {
-        1 | 2 => {
-            let delta = if kind == 1 { STEP } else { -STEP };
+unsafe fn run_action(a: usize) {
+    match a {
+        A_UP | A_DOWN => {
+            let delta = if a == A_UP { STEP } else { -STEP };
             let (text, pct) = {
                 let mut st = lock();
                 let t = targets(&st);
@@ -997,10 +1139,7 @@ unsafe fn handle_dial(_hwnd: HWND, kind: usize) {
             schedule_apply();
             let _ = InvalidateRect(fly_hwnd(), None, FALSE);
         }
-        3 => {
-            let action = lock().s.button;
-            match action {
-                BTN_CYCLE => {
+        A_CYCLE => {
                     let (name, pct, sync) = {
                         let mut st = lock();
                         let usable = |m: &Mon| m.ok && !m.off;
@@ -1028,19 +1167,418 @@ unsafe fn handle_dial(_hwnd: HWND, kind: usize) {
                         schedule_apply();
                     }
                     let _ = InvalidateRect(fly_hwnd(), None, FALSE);
-                }
-                BTN_LOCK => {
-                    let _ = LockWorkStation();
-                }
-                BTN_OFF => screens_off(),
-                BTN_LOCK_OFF => {
-                    let _ = LockWorkStation();
-                    screens_off();
-                }
-                _ => {}
-            }
+        }
+        A_LOCK => {
+            let _ = LockWorkStation();
+        }
+        A_OFF => screens_off(),
+        A_LOCK_OFF => {
+            let _ = LockWorkStation();
+            screens_off();
         }
         _ => {}
+    }
+}
+
+// ---------- key bindings window ----------
+
+// layout in 96-dpi pixels
+const KW: i32 = 486;
+const K_ROW0: i32 = 48;
+const K_ROW: i32 = 40;
+const K_COL: [i32; SLOTS] = [196, 336];
+const K_BOX_W: i32 = 130;
+const K_NOTE_Y: i32 = K_ROW0 + K_ROW * N_ACTIONS as i32 + 4;
+const K_FOOT_Y: i32 = K_NOTE_Y + 52;
+const KH: i32 = K_FOOT_Y + 56;
+
+fn scaled(l: i32, t: i32, r: i32, b: i32) -> RECT {
+    RECT { left: px(l), top: px(t), right: px(r), bottom: px(b) }
+}
+
+fn k_slot_rect(a: usize, s: usize) -> RECT {
+    let y = K_ROW0 + K_ROW * a as i32;
+    scaled(K_COL[s], y + 5, K_COL[s] + K_BOX_W, y + 35)
+}
+
+fn k_reset_rect() -> RECT {
+    scaled(20, K_FOOT_Y + 12, 190, K_FOOT_Y + 44)
+}
+
+fn k_done_rect() -> RECT {
+    scaled(KW - 130, K_FOOT_Y + 12, KW - 20, K_FOOT_Y + 44)
+}
+
+fn inside(r: &RECT, x: i32, y: i32) -> bool {
+    x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+enum KHit {
+    Slot(usize, usize),
+    Reset,
+    Done,
+    Nothing,
+}
+
+fn k_hit(x: i32, y: i32) -> KHit {
+    for a in 0..N_ACTIONS {
+        for s in 0..SLOTS {
+            if inside(&k_slot_rect(a, s), x, y) {
+                return KHit::Slot(a, s);
+            }
+        }
+    }
+    if inside(&k_reset_rect(), x, y) {
+        KHit::Reset
+    } else if inside(&k_done_rect(), x, y) {
+        KHit::Done
+    } else {
+        KHit::Nothing
+    }
+}
+
+unsafe fn vk_name(vk: u16) -> String {
+    let fixed = match vk {
+        0xAD => "Mute (dial press)",
+        0xAE => "Volume Down (dial)",
+        0xAF => "Volume Up (dial)",
+        0xB0 => "Next Track",
+        0xB1 => "Previous Track",
+        0xB2 => "Stop",
+        0xB3 => "Play/Pause",
+        0xA6 => "Browser Back",
+        0xA7 => "Browser Forward",
+        0xA8 => "Browser Refresh",
+        0xA9 => "Browser Stop",
+        0xAA => "Browser Search",
+        0xAB => "Favorites",
+        0xAC => "Browser Home",
+        0xB4 => "Mail",
+        0xB5 => "Media Select",
+        0xB6 => "Launch App 1",
+        0xB7 => "Launch App 2",
+        0x5D => "Menu",
+        0x2C => "Print Screen",
+        0x13 => "Pause",
+        _ => "",
+    };
+    if !fixed.is_empty() {
+        return fixed.into();
+    }
+    let sc = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC);
+    // navigation keys need the "extended" bit or Windows names them after the numpad keys
+    let ext = matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x6F | 0x90);
+    let mut buf = [0u16; 64];
+    let n = GetKeyNameTextW(((sc as i32) << 16) | if ext { 1 << 24 } else { 0 }, &mut buf);
+    if n > 0 {
+        String::from_utf16_lossy(&buf[..n as usize])
+    } else {
+        format!("Key {:#04X}", vk)
+    }
+}
+
+unsafe fn key_name(k: Key) -> String {
+    let mut s = String::new();
+    for (bit, name) in [(MOD_CTRL, "Ctrl+"), (MOD_ALT, "Alt+"), (MOD_SHIFT, "Shift+"), (MOD_WIN, "Win+")] {
+        if k.mods & bit != 0 {
+            s.push_str(name);
+        }
+    }
+    s + &vk_name(k.vk)
+}
+
+fn set_note(s: String) {
+    *KEYS_NOTE.lock().unwrap_or_else(|e| e.into_inner()) = s;
+}
+
+unsafe fn show_keys() {
+    let hw = HWND(KEYS_HWND.load(Ordering::Relaxed) as *mut c_void);
+    CAPTURE.store(-1, Ordering::Relaxed);
+    set_note("Click a box, then press the key you want. Right-click a box to clear it.".into());
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    let mut r = RECT { left: 0, top: 0, right: px(KW), bottom: px(KH) };
+    let _ = AdjustWindowRectEx(&mut r, style, FALSE, WINDOW_EX_STYLE(0));
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let mut wa = RECT::default();
+    let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut wa as *mut _ as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+    let x = wa.left + (wa.right - wa.left - w) / 2;
+    let y = wa.top + (wa.bottom - wa.top - h) / 2;
+    let _ = SetWindowPos(hw, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW);
+    let _ = SetForegroundWindow(hw);
+    let _ = InvalidateRect(hw, None, TRUE);
+}
+
+unsafe fn paint_keys(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let wnd_dc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let hdc = CreateCompatibleDC(wnd_dc);
+    let bmp = CreateCompatibleBitmap(wnd_dc, rc.right, rc.bottom);
+    let old_bmp = SelectObject(hdc, bmp);
+    fill(hdc, &rc, 0x0020_2020);
+
+    let face = w!("Segoe UI");
+    let (binds, dial) = {
+        let st = lock();
+        (st.s.binds, st.s.dial)
+    };
+    let cap = CAPTURE.load(Ordering::Relaxed);
+    let pending = *PENDING.lock().unwrap_or_else(|e| e.into_inner());
+
+    draw_text(hdc, "Action", scaled(20, 14, 190, 40), 13, 600, 0x00A0_A0A0, DT_LEFT, face);
+    for (s, label) in ["Key 1", "Key 2"].iter().enumerate() {
+        draw_text(hdc, label, scaled(K_COL[s], 14, K_COL[s] + K_BOX_W, 40), 13, 600, 0x00A0_A0A0, DT_CENTER, face);
+    }
+
+    for a in 0..N_ACTIONS {
+        let y = K_ROW0 + K_ROW * a as i32;
+        let off = !dial && (a == A_UP || a == A_DOWN);
+        let col = if off { 0x0080_8080 } else { 0x00FF_FFFF };
+        let label = if off { format!("{} (off)", ACTIONS[a].1) } else { ACTIONS[a].1.to_string() };
+        draw_text(hdc, &label, scaled(20, y, K_COL[0] - 8, y + K_ROW), 15, 400, col, DT_LEFT | DT_END_ELLIPSIS, face);
+        for s in 0..SLOTS {
+            let r = k_slot_rect(a, s);
+            let selected = cap == (a * SLOTS + s) as i32;
+            if selected {
+                fill(hdc, &r, 0x00FF_C24C);
+                fill(hdc, &RECT { left: r.left + px(2), top: r.top + px(2), right: r.right - px(2), bottom: r.bottom - px(2) }, 0x0038_3838);
+            } else {
+                fill(hdc, &r, 0x0030_3030);
+            }
+            let k = binds[a][s];
+            let (text, tcol) = if selected {
+                match pending {
+                    Some((c, pk)) if c == cap => (format!("{} ?", key_name(pk)), 0x00FF_C24C),
+                    _ => ("Press a key...".to_string(), 0x00FF_C24C),
+                }
+            } else if k.vk == 0 {
+                ("-".to_string(), 0x0070_7070)
+            } else {
+                (key_name(k), 0x00FF_FFFF)
+            };
+            let tr = RECT { left: r.left + px(6), right: r.right - px(6), ..r };
+            draw_text(hdc, &text, tr, 13, 400, tcol, DT_CENTER | DT_END_ELLIPSIS, face);
+        }
+    }
+
+    // a note may carry a second line (a warning's follow-up), which replaces the dial hint
+    let note = KEYS_NOTE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (line1, line2) = note.split_once('\n').unwrap_or((&note, ""));
+    draw_text(hdc, line1, scaled(20, K_NOTE_Y, KW - 20, K_NOTE_Y + 24), 13, 400, 0x00FF_C24C, DT_LEFT | DT_END_ELLIPSIS, face);
+    let (hint, hcol) = if line2.is_empty() {
+        ("Dial: turning sends Volume Up / Down, pressing sends Mute.", 0x0090_9090)
+    } else {
+        (line2, 0x00FF_FFFF)
+    };
+    draw_text(hdc, hint, scaled(20, K_NOTE_Y + 24, KW - 20, K_NOTE_Y + 46), 13, 400, hcol, DT_LEFT | DT_END_ELLIPSIS, face);
+
+    fill(hdc, &scaled(0, K_FOOT_Y, KW, KH), 0x002B_2B2B);
+    for (r, label) in [(k_reset_rect(), "Reset to defaults"), (k_done_rect(), "Done")] {
+        fill(hdc, &r, 0x003C_3C3C);
+        draw_text(hdc, label, r, 14, 400, 0x00FF_FFFF, DT_CENTER, face);
+    }
+
+    let _ = BitBlt(wnd_dc, 0, 0, rc.right, rc.bottom, hdc, 0, 0, SRCCOPY);
+    SelectObject(hdc, old_bmp);
+    let _ = DeleteObject(bmp);
+    let _ = DeleteDC(hdc);
+    let _ = EndPaint(hwnd, &ps);
+}
+
+// well-known shortcuts that other apps don't register with Windows, so the hotkey probe can't see them
+const KNOWN: &[(u8, u16, &str)] = &[
+    (MOD_CTRL, b'C' as u16, "Copy"),
+    (MOD_CTRL, b'V' as u16, "Paste"),
+    (MOD_CTRL, b'X' as u16, "Cut"),
+    (MOD_CTRL, b'Z' as u16, "Undo"),
+    (MOD_CTRL, b'Y' as u16, "Redo"),
+    (MOD_CTRL, b'A' as u16, "Select all"),
+    (MOD_CTRL, b'S' as u16, "Save"),
+    (MOD_CTRL, b'F' as u16, "Find"),
+    (MOD_CTRL, b'P' as u16, "Print"),
+    (MOD_CTRL, b'N' as u16, "New"),
+    (MOD_CTRL, b'O' as u16, "Open"),
+    (MOD_CTRL, b'W' as u16, "Close tab"),
+    (MOD_CTRL, b'T' as u16, "New tab"),
+    (MOD_CTRL, b'R' as u16, "Refresh"),
+    (MOD_CTRL, 0x09, "Next tab"),
+    (MOD_CTRL | MOD_SHIFT, 0x09, "Previous tab"),
+    (MOD_CTRL | MOD_SHIFT, b'T' as u16, "Reopen tab"),
+    (MOD_CTRL | MOD_SHIFT, 0x1B, "Task Manager"),
+    (MOD_CTRL, 0x1B, "Start menu"),
+    (MOD_ALT, 0x09, "Switch apps"),
+    (MOD_ALT | MOD_SHIFT, 0x09, "Switch apps"),
+    (MOD_ALT, 0x73, "Close window"),
+    (MOD_ALT, 0x1B, "Switch apps"),
+    (MOD_ALT, 0x20, "Window menu"),
+    (MOD_ALT, 0x0D, "Properties / fullscreen"),
+    (MOD_ALT, 0x25, "Back"),
+    (MOD_ALT, 0x27, "Forward"),
+    (MOD_WIN, b'L' as u16, "Lock (Windows always wins)"),
+    (MOD_WIN, b'D' as u16, "Show desktop"),
+    (MOD_WIN, b'E' as u16, "File Explorer"),
+    (MOD_WIN, b'R' as u16, "Run"),
+    (MOD_WIN, b'I' as u16, "Settings"),
+    (MOD_WIN, b'V' as u16, "Clipboard history"),
+    (MOD_WIN, b'X' as u16, "Quick Link menu"),
+    (MOD_WIN, 0x09, "Task View"),
+    (MOD_WIN | MOD_SHIFT, b'S' as u16, "Snipping Tool"),
+    (MOD_WIN, 0x25, "Snap window"),
+    (MOD_WIN, 0x26, "Maximize window"),
+    (MOD_WIN, 0x27, "Snap window"),
+    (MOD_WIN, 0x28, "Minimize window"),
+    (MOD_WIN, 0xBE, "Emoji panel"),
+];
+
+// why this key might be a bad choice, or None if it looks free
+unsafe fn conflict(k: Key) -> Option<String> {
+    if let Some((_, _, what)) = KNOWN.iter().find(|(m, vk, _)| *m == k.mods && *vk == k.vk) {
+        return Some(format!("Windows/app shortcut ({})", what));
+    }
+    let f13_f24 = (0x7C..=0x87).contains(&k.vk);
+    if k.mods == 0 && !is_media(k.vk) && !f13_f24 {
+        return Some(match k.vk {
+            0x2C => "Print Screen takes screenshots".into(),
+            0x70..=0x7B => "Apps use this key".into(),
+            _ => "You'd lose this key for typing".into(),
+        });
+    }
+    if k.mods == MOD_SHIFT && !is_media(k.vk) && !f13_f24 {
+        return Some("You'd lose this key for typing".into());
+    }
+    // another app (or Windows) holds it if we can't register it ourselves
+    const PROBE_ID: i32 = 0xB0B0;
+    let mods = HOT_KEY_MODIFIERS(k.mods as u32) | MOD_NOREPEAT;
+    if RegisterHotKey(main_hwnd(), PROBE_ID, mods, k.vk as u32).is_ok() {
+        let _ = UnregisterHotKey(main_hwnd(), PROBE_ID);
+        None
+    } else {
+        Some("Another app or Windows already uses this".into())
+    }
+}
+
+// a key arrived for the slot in CAPTURE
+unsafe fn assign_key(vk: u16, mods: u8) {
+    let c = CAPTURE.load(Ordering::Relaxed);
+    if c < 0 {
+        return;
+    }
+    let (a, s) = (c as usize / SLOTS, c as usize % SLOTS);
+    let name = ACTIONS[a].1;
+    let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if mods == 0 && vk == VK_ESCAPE.0 {
+        CAPTURE.store(-1, Ordering::Relaxed);
+        set_note("Cancelled.".into());
+        return;
+    }
+    if mods == 0 && (vk == VK_DELETE.0 || vk == VK_BACK.0) {
+        CAPTURE.store(-1, Ordering::Relaxed);
+        lock().s.binds[a][s] = NONE_KEY;
+        save_settings();
+        set_note(format!("Cleared a key from {}.", name));
+        return;
+    }
+    let key = Key { vk, mods };
+    let already_ours = lock().s.binds.iter().any(|slots| slots.contains(&key));
+    let confirmed = pending == Some((c, key));
+    if !confirmed && !already_ours {
+        if let Some(why) = conflict(key) {
+            // stay in capture mode: the same key again means "use it anyway"
+            *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((c, key));
+            set_note(format!("{}: {}.\nPress it again to use it anyway, or Esc to cancel.", key_name(key), why));
+            return;
+        }
+    }
+    CAPTURE.store(-1, Ordering::Relaxed);
+    let mut moved_from: Option<&str> = None;
+    {
+        let mut st = lock();
+        for a2 in 0..N_ACTIONS {
+            for s2 in 0..SLOTS {
+                if (a2, s2) != (a, s) && st.s.binds[a2][s2] == key {
+                    st.s.binds[a2][s2] = NONE_KEY;
+                    if a2 != a {
+                        moved_from = Some(ACTIONS[a2].1);
+                    }
+                }
+            }
+        }
+        st.s.binds[a][s] = key;
+    }
+    save_settings();
+    let kn = key_name(key);
+    set_note(match moved_from {
+        Some(from) => format!("{} now does {} (removed from {}).", kn, name, from),
+        None => format!("{} now does {}.", kn, name),
+    });
+}
+
+unsafe extern "system" fn keys_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    LAST_WHO.store(5, Ordering::Relaxed);
+    LAST_MSG.store(msg, Ordering::Relaxed);
+    let (x, y) = ((lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32);
+    if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_CLOSE) || (msg == WM_ACTIVATE && (wp.0 & 0xFFFF) as u32 == WA_INACTIVE) {
+        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = None; // any click or leaving drops an unconfirmed key
+    }
+    match msg {
+        WM_PAINT => {
+            paint_keys(hwnd);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_LBUTTONDOWN => {
+            match k_hit(x, y) {
+                KHit::Slot(a, s) => {
+                    CAPTURE.store((a * SLOTS + s) as i32, Ordering::Relaxed);
+                    set_note(format!("Press a key for {}. Esc cancels, Delete clears.", ACTIONS[a].1));
+                }
+                KHit::Reset => {
+                    CAPTURE.store(-1, Ordering::Relaxed);
+                    lock().s.binds = DEFAULT_BINDS;
+                    save_settings();
+                    set_note("Default keys restored.".into());
+                }
+                KHit::Done => {
+                    CAPTURE.store(-1, Ordering::Relaxed);
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+                KHit::Nothing => {
+                    CAPTURE.store(-1, Ordering::Relaxed);
+                }
+            }
+            let _ = InvalidateRect(hwnd, None, FALSE);
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            if let KHit::Slot(a, s) = k_hit(x, y) {
+                CAPTURE.store(-1, Ordering::Relaxed);
+                lock().s.binds[a][s] = NONE_KEY;
+                save_settings();
+                set_note(format!("Cleared a key from {}.", ACTIONS[a].1));
+                let _ = InvalidateRect(hwnd, None, FALSE);
+            }
+            LRESULT(0)
+        }
+        WM_BIND => {
+            assign_key(wp.0 as u16, lp.0 as u8);
+            let _ = InvalidateRect(hwnd, None, FALSE);
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            // never keep grabbing keys once the window is in the background
+            if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE && CAPTURE.swap(-1, Ordering::Relaxed) >= 0 {
+                set_note("Cancelled.".into());
+                let _ = InvalidateRect(hwnd, None, FALSE);
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            CAPTURE.store(-1, Ordering::Relaxed);
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
@@ -1048,7 +1586,7 @@ unsafe fn handle_dial(_hwnd: HWND, kind: usize) {
 
 const ID_DIAL: usize = 10;
 const ID_EXT_ONLY: usize = 11;
-const ID_BTN: usize = 20; // 20..=24
+const ID_KEYS: usize = 12;
 const ID_TARGET: usize = 100; // 100+i
 const ID_TARGET_ALL: usize = 199;
 const ID_TARGET_VOL: usize = 198;
@@ -1067,23 +1605,17 @@ fn chk(b: bool) -> MENU_ITEM_FLAGS {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let (dial, button, target, mons) = {
+    let (dial, target, mons) = {
         let st = lock();
         let mons: Vec<(String, bool, bool, i32)> = st.mons.iter().map(|m| (m.name.clone(), m.off, m.ok, m.pct)).collect();
-        (st.s.dial, st.s.button, st.target, mons)
+        (st.s.dial, st.target, mons)
     };
     let startup = startup_enabled();
 
     let menu = CreatePopupMenu().unwrap();
     add(menu, chk(dial), ID_DIAL, "Dial controls brightness");
     add(menu, chk(lock().s.ext_only), ID_EXT_ONLY, "Only the external keyboard's dial");
-
-    let btn = CreatePopupMenu().unwrap();
-    for (i, name) in ["Switch display", "Lock PC", "Turn screens off", "Lock PC + turn screens off", "Do nothing"].iter().enumerate() {
-        add(btn, chk(button == i as u8), ID_BTN + i, name);
-    }
-    let t = wide("Dial button action");
-    let _ = AppendMenuW(menu, MF_POPUP | MF_STRING, btn.0 as usize, PCWSTR(t.as_ptr()));
+    add(menu, MF_UNCHECKED, ID_KEYS, "Key bindings...");
 
     let tgt = CreatePopupMenu().unwrap();
     for (i, (label, off, ok, pct)) in mons.iter().enumerate() {
@@ -1139,10 +1671,7 @@ unsafe fn on_command(hwnd: HWND, cmd: usize) {
             }
             save_settings();
         }
-        c if (ID_BTN..ID_BTN + 5).contains(&c) => {
-            lock().s.button = (c - ID_BTN) as u8;
-            save_settings();
-        }
+        ID_KEYS => show_keys(),
         ID_TARGET_ALL => {
             let synced = {
                 let mut st = lock();
@@ -1228,7 +1757,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DIAL => {
-            handle_dial(hwnd, wp.0);
+            run_action(wp.0);
             LRESULT(0)
         }
         WM_INPUT => {
@@ -1352,10 +1881,28 @@ fn main() {
         let fly = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, fcls, w!(""), WS_POPUP, 0, 0, px(FLY_W), px(200), None, None, hinst, None).unwrap();
         FLY_HWND.store(fly.0 as isize, Ordering::Relaxed);
 
+        let kcls = w!("LiteBrightnessKeys");
+        let kwc = WNDCLASSW {
+            lpfnWndProc: Some(keys_proc),
+            hInstance: hinst.into(),
+            lpszClassName: kcls,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        RegisterClassW(&kwc);
+        let keys = CreateWindowExW(
+            WINDOW_EX_STYLE(0), kcls, w!("Lite Brightness - Key bindings"), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            0, 0, px(KW), px(KH), None, None, hinst, None,
+        )
+        .unwrap();
+        KEYS_HWND.store(keys.0 as isize, Ordering::Relaxed);
+
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
 
         let icon = make_icon();
         ICON.store(icon.0 as isize, Ordering::Relaxed);
+        SendMessageW(keys, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(icon.0 as isize));
+        SendMessageW(keys, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(icon.0 as isize));
         if !Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd, icon)).as_bool() {
             SetTimer(hwnd, TIMER_TRAY, 2000, None);
         }

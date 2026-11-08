@@ -17,7 +17,7 @@ Written in Rust with the raw Win32 API. No Electron, no runtime, no installer.
 - **Laptop panel brightness over WMI.**
 - **Turn any display off and on** from the flyout, including the laptop screen.
 - **Keyboard dial / volume knob controls brightness.** Turn the knob to dim or brighten, press it to switch which display is controlled.
-- **Dial button actions** you can pick from the tray menu: switch display, lock the PC, turn screens off, lock + screens off, or do nothing.
+- **Rebindable keys, like a game's controls screen.** Every action (brightness up, brightness down, switch display, lock PC, screens off, lock + screens off) has two key slots. Click a slot and press any key or combo (Ctrl / Alt / Shift / Win + key, F13–F24, media keys or the dial itself). If a key is already used, it moves to the new action.
 - **Dial target cycle:** monitor, laptop, all displays (kept in sync), then normal Windows volume.
 - **Only reacts to your external keyboard.** The laptop's own volume and mute keys keep working as volume keys.
 - **Small on-screen popup** that shows the level while you turn the dial.
@@ -56,8 +56,10 @@ If a monitor shows "no brightness control", try a direct cable and turn DDC/CI o
 ## Use
 
 - **Left-click** the tray icon: brightness sliders and power buttons for each display. The mouse wheel over a slider also works.
-- **Right-click** the tray icon: settings menu (dial on/off, dial button action, target display, turn a display off, run at startup, refresh displays, exit).
-- **Dial:** turn to change brightness in steps of 5. Press to run the chosen button action (by default it cycles the target display).
+- **Right-click** the tray icon: settings menu (dial on/off, key bindings, target display, turn a display off, run at startup, refresh displays, exit).
+- **Dial:** turn to change brightness in steps of 5. Press to switch the target display (default keys; change them in **Key bindings...**).
+- **Key bindings window:** click a box, press a key. Esc cancels, Delete or Backspace clears, right-click clears. **Reset to defaults** puts the dial back on brightness and switch display.
+- **Clash check:** before a key is saved, Lite Brightness checks whether another app or Windows has already registered it as a global shortcut, and also checks a list of common shortcuts (Ctrl+C, Alt+Tab, Win+D, ...) and plain typing keys. If there's a clash it tells you why, and you press the same key again to use it anyway. Shortcuts that live only inside one app (for example a game's own keys) can't be detected.
 
 ## Using a different keyboard
 
@@ -77,15 +79,22 @@ If you want the dial to react to every keyboard, untick **Only the external keyb
 
 ```
 dial=1
-button=0
 ext_only=1
 device=VID_0E6A
+bind_up=175+0,0+0
+bind_down=174+0,0+0
+bind_cycle=173+0,0+0
+bind_lock=0+0,0+0
+bind_off=0+0,0+0
+bind_lockoff=0+0,0+0
 ```
 
-- `dial`: 1 = the dial controls brightness
-- `button`: 0 switch display, 1 lock PC, 2 screens off, 3 lock + screens off, 4 nothing
-- `ext_only`: 1 = only the external keyboard's dial
+- `dial`: 1 = the brightness up / down keys are active
+- `ext_only`: 1 = media keys (the dial) only count from the external keyboard. Normal keyboard shortcuts work from any keyboard.
 - `device`: which keyboard counts as the external one
+- `bind_*`: two key slots per action, each `virtual-key-code+modifiers` (modifiers: 1 Alt, 2 Ctrl, 4 Shift, 8 Win, added together; `0+0` = empty). Easier to set from the Key bindings window.
+
+Old settings files with `button=` are converted automatically the first time.
 
 ## Build
 
@@ -103,7 +112,7 @@ The exe is at `target/release/lite-brightness.exe`.
 
 - **External monitors:** `GetPhysicalMonitorsFromHMONITOR` plus `SetMonitorBrightness` (DDC/CI). Power uses VCP code `0xD6`.
 - **Laptop panel:** WMI `WmiMonitorBrightnessMethods.WmiSetBrightness` in `root\wmi`. Turning the laptop screen off and on uses `DisplaySwitch.exe /external` and `/extend`.
-- **Dial:** a low-level keyboard hook (`WH_KEYBOARD_LL`) swallows `VK_VOLUME_UP`, `VK_VOLUME_DOWN` and `VK_VOLUME_MUTE`. A Raw Input listener tells it which physical keyboard sent the key.
+- **Dial and key bindings:** a low-level keyboard hook (`WH_KEYBOARD_LL`) swallows any bound key (by default `VK_VOLUME_UP`, `VK_VOLUME_DOWN` and `VK_VOLUME_MUTE`) and runs its action. A Raw Input listener tells it which physical keyboard sent a media key.
 - Slow hardware calls run on a worker thread so typing never stalls.
 
 ## Troubleshooting
@@ -115,7 +124,7 @@ The exe is at `target/release/lite-brightness.exe`.
 
 ## Contributing
 
-Issues and pull requests are welcome. The whole app is one file, `src/main.rs`. Ideas: dimming below the hardware minimum, per-display presets, hotkeys, an installer.
+Issues and pull requests are welcome. The whole app is one file, `src/main.rs`. Ideas: dimming below the hardware minimum, per-display presets, an installer.
 
 ## License
 
@@ -124,3 +133,5 @@ MIT, see [LICENSE](LICENSE).
 ---
 
 *Keywords: low ram twinkletray alternative, low RAM Twinkle Tray alternative, lightweight twinkletray alternative, twinkletray alternative, Twinkle Tray alternative, twinkle tray lightweight, twinkletray replacement, lightweight brightness control Windows, external monitor brightness, DDC/CI, laptop brightness slider, multi monitor brightness, tray brightness app, volume knob brightness, keyboard dial brightness, volume dial brightness, Ant Esports MK800, MK800 volume knob, Windows 11 brightness, Windows 10 brightness, Lenovo monitor brightness, low RAM, portable, Rust, Win32, WMI, no Electron.*
+
+*More keywords: remap volume knob, remap keyboard knob Windows, keyboard knob brightness Windows 11, volume knob to brightness, change volume knob function, reprogram volume dial, volume wheel brightness, media keys brightness, custom key bindings brightness, brightness hotkey Windows, brightness keyboard shortcut Windows 10, brightness shortcut external monitor, hotkey external monitor brightness, keyboard shortcut monitor brightness, global hotkey brightness, rebind keyboard dial, knob lock PC shortcut, turn off monitor hotkey, turn off screen shortcut Windows, lock PC with keyboard knob, F13 F24 brightness, Ctrl Alt brightness shortcut, Twinkle Tray hotkeys alternative, Twinkle Tray volume knob, Twinkle Tray lightweight alternative, Monitorian alternative, ClickMonitorDDC alternative, Dimmer alternative, f.lux alternative brightness, PangoBright alternative, brightness slider tray Windows, control second monitor brightness, adjust external monitor brightness from PC, change monitor brightness without buttons, DDC/CI brightness tool, DDC CI Windows app, monitor brightness app small, lightweight brightness app, brightness app low memory, tiny brightness utility Windows, open source brightness control Windows, free brightness control Windows, laptop and monitor brightness together, sync brightness all monitors, dual monitor brightness, Ant Esports MK800 knob software, MK800 software, mechanical keyboard knob software, keyboard rotary encoder brightness, rotary knob brightness Windows.*

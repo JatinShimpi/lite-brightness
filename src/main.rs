@@ -87,6 +87,7 @@ const DEFAULT_BINDS: [[Key; SLOTS]; N_ACTIONS] = [
 struct Settings {
     dial: bool,     // brightness up/down keys are active
     ext_only: bool, // media keys (the dial) only count from the external keyboard
+    cycle_all: bool, // "All displays" is one of the stops when switching the dial target
     binds: [[Key; SLOTS]; N_ACTIONS],
 }
 
@@ -109,7 +110,7 @@ struct State {
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
-    s: Settings { dial: true, ext_only: true, binds: DEFAULT_BINDS },
+    s: Settings { dial: true, ext_only: true, cycle_all: true, binds: DEFAULT_BINDS },
     mons: Vec::new(),
     target: 0,
 });
@@ -234,6 +235,7 @@ fn load_settings() {
             "dial" => st.s.dial = v.trim() == "1",
             "button" => old_button = v.trim().parse().ok(),
             "ext_only" => st.s.ext_only = v.trim() == "1",
+            "cycle_all" => st.s.cycle_all = v.trim() == "1",
             "device" => *DEVICE_MATCH.lock().unwrap_or_else(|e| e.into_inner()) = v.trim().to_uppercase(),
             k if k.starts_with("bind_") => {
                 if let Some(a) = ACTIONS.iter().position(|(id, _)| *id == &k[5..]) {
@@ -257,7 +259,7 @@ fn load_settings() {
 fn save_settings() {
     let st = lock();
     let device = DEVICE_MATCH.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let mut text = format!("dial={}\next_only={}\ndevice={}\n", st.s.dial as u8, st.s.ext_only as u8, device);
+    let mut text = format!("dial={}\next_only={}\ncycle_all={}\ndevice={}\n", st.s.dial as u8, st.s.ext_only as u8, st.s.cycle_all as u8, device);
     for (a, (id, _)) in ACTIONS.iter().enumerate() {
         let slots: Vec<String> = st.s.binds[a].iter().map(|k| format!("{}+{}", k.vk, k.mods)).collect();
         text.push_str(&format!("bind_{}={}\n", id, slots.join(",")));
@@ -1097,6 +1099,14 @@ unsafe fn screens_off() {
 const TARGET_ALL: i32 = -1;
 const TARGET_VOLUME: i32 = -2;
 
+fn avg_all(st: &State) -> Option<i32> {
+    let t = targets(st);
+    if t.is_empty() {
+        return None;
+    }
+    Some((t.iter().map(|&i| st.mons[i].pct).sum::<i32>() as f32 / t.len() as f32).round() as i32)
+}
+
 fn sync_all(st: &mut State) -> Option<i32> {
     let t = targets(st);
     if t.is_empty() {
@@ -1140,13 +1150,13 @@ unsafe fn run_action(a: usize) {
             let _ = InvalidateRect(fly_hwnd(), None, FALSE);
         }
         A_CYCLE => {
-                    let (name, pct, sync) = {
+                    let (name, pct) = {
                         let mut st = lock();
                         let usable = |m: &Mon| m.ok && !m.off;
                         // order: external displays, laptop panel, all displays, volume
                         let mut order: Vec<i32> = (0..st.mons.len()).filter(|&i| usable(&st.mons[i]) && !st.mons[i].internal).map(|i| i as i32).collect();
                         order.extend((0..st.mons.len()).filter(|&i| usable(&st.mons[i]) && st.mons[i].internal).map(|i| i as i32));
-                        if order.len() > 1 {
+                        if order.len() > 1 && st.s.cycle_all {
                             order.push(TARGET_ALL);
                         }
                         order.push(TARGET_VOLUME);
@@ -1157,15 +1167,13 @@ unsafe fn run_action(a: usize) {
                         st.target = next;
                         let (name, pct) = match next {
                             TARGET_VOLUME => ("Volume".to_string(), -1),
-                            TARGET_ALL => ("All displays".to_string(), sync_all(&mut st).unwrap_or(-1)),
+                            // just passing through: displays only sync once the dial is actually turned
+                            TARGET_ALL => ("All displays".to_string(), avg_all(&st).unwrap_or(-1)),
                             i => (st.mons[i as usize].name.clone(), st.mons[i as usize].pct),
                         };
-                        (name, pct, next == TARGET_ALL)
+                        (name, pct)
                     };
                     show_osd(format!("Controlling: {}", name), pct);
-                    if sync {
-                        schedule_apply();
-                    }
                     let _ = InvalidateRect(fly_hwnd(), None, FALSE);
         }
         A_LOCK => {
@@ -1587,6 +1595,7 @@ unsafe extern "system" fn keys_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 const ID_DIAL: usize = 10;
 const ID_EXT_ONLY: usize = 11;
 const ID_KEYS: usize = 12;
+const ID_CYCLE_ALL: usize = 13;
 const ID_TARGET: usize = 100; // 100+i
 const ID_TARGET_ALL: usize = 199;
 const ID_TARGET_VOL: usize = 198;
@@ -1615,6 +1624,7 @@ unsafe fn show_menu(hwnd: HWND) {
     let menu = CreatePopupMenu().unwrap();
     add(menu, chk(dial), ID_DIAL, "Dial controls brightness");
     add(menu, chk(lock().s.ext_only), ID_EXT_ONLY, "Only the external keyboard's dial");
+    add(menu, chk(lock().s.cycle_all), ID_CYCLE_ALL, "Include 'All displays' when switching");
     add(menu, MF_UNCHECKED, ID_KEYS, "Key bindings...");
 
     let tgt = CreatePopupMenu().unwrap();
@@ -1672,16 +1682,18 @@ unsafe fn on_command(hwnd: HWND, cmd: usize) {
             save_settings();
         }
         ID_KEYS => show_keys(),
-        ID_TARGET_ALL => {
-            let synced = {
+        ID_CYCLE_ALL => {
+            {
                 let mut st = lock();
-                st.target = TARGET_ALL;
-                sync_all(&mut st).is_some()
-            };
-            if synced {
-                schedule_apply();
+                st.s.cycle_all = !st.s.cycle_all;
+                if !st.s.cycle_all && st.target == TARGET_ALL {
+                    st.target = 0;
+                }
             }
+            save_settings();
         }
+        // displays only sync once the dial is actually turned
+        ID_TARGET_ALL => lock().target = TARGET_ALL,
         ID_TARGET_VOL => lock().target = TARGET_VOLUME,
         c if (ID_TARGET..ID_TARGET + 64).contains(&c) => lock().target = (c - ID_TARGET) as i32,
         c if (ID_OFF..ID_OFF + 64).contains(&c) => toggle_display_power(c - ID_OFF),
